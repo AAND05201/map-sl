@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>แผนที่ปฏิบัติงานสำรวจ</title>
+    
+    <!-- Leaflet CSS & JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <!-- Tailwind CSS (for UI styling) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <style>
+        body, html { height: 100%; margin: 0; padding: 0; font-family: 'Sarabun', sans-serif; }
+        #map { height: 100%; width: 100%; z-index: 1; }
+        
+        /* สไตล์หลักของหมุดแผนที่ */
+        .marker-pin {
+          width: 28px;
+          height: 28px;
+          border-radius: 50% 50% 50% 0;
+          position: absolute;
+          transform: rotate(-45deg);
+          left: 50%;
+          top: 50%;
+          margin: -14px 0 0 -14px;
+          border: 2px solid white;
+          box-shadow: 1px 1px 4px rgba(0,0,0,0.5);
+          transition: background-color 0.3s;
+        }
+
+        /* เงื่อนไขกระพริบเมื่อสถานะ = เข้างาน */
+        @keyframes pulse-ring {
+            0% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.7), 1px 1px 4px rgba(0,0,0,0.5); transform: rotate(-45deg) scale(1); }
+            50% { box-shadow: 0 0 0 15px rgba(255, 0, 0, 0), 1px 1px 4px rgba(0,0,0,0.5); transform: rotate(-45deg) scale(1.1); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0), 1px 1px 4px rgba(0,0,0,0.5); transform: rotate(-45deg) scale(1); }
+        }
+        .blinking-marker {
+            animation: pulse-ring 1.5s infinite;
+            border: 2px solid red;
+        }
+
+        /* Popup Customization */
+        .leaflet-popup-content-wrapper { border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        .leaflet-popup-content { margin: 16px; min-width: 250px; }
+        
+        /* Loading Overlay */
+        #loading-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(255,255,255,0.8); z-index: 9999;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+        }
+        .loader {
+            border: 6px solid #f3f3f3; border-radius: 50%; border-top: 6px solid #3b82f6;
+            width: 50px; height: 50px; animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+    <!-- Loading Screen -->
+    <div id="loading-overlay">
+        <div class="loader mb-4"></div>
+        <p class="text-lg font-semibold text-gray-700" id="loading-text">กำลังโหลดข้อมูลแผนที่...</p>
+    </div>
+
+    <!-- แจ้งเตือนกรณีเป็น Demo Mode (ไม่มี API URL) -->
+    <div id="demo-banner" class="hidden absolute top-4 left-1/2 transform -translate-x-1/2 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 shadow-lg z-[1000] w-11/12 max-w-lg rounded">
+        <p class="font-bold">⚠️ โหมดทดลอง (Demo Mode)</p>
+        <p class="text-sm">คุณยังไม่ได้ใส่ Google Apps Script URL หมุดที่คุณเห็นคือข้อมูลจำลอง หากต้องการใช้ข้อมูลจริง กรุณาใส่ URL ในโค้ด</p>
+        <button onclick="document.getElementById('demo-banner').style.display='none'" class="mt-2 text-xs bg-yellow-200 px-2 py-1 rounded">ปิด</button>
+    </div>
+
+    <!-- Map Container -->
+    <div id="map"></div>
+
+    <script>
+        // ==========================================
+        // การตั้งค่าระบบ
+        // นำ URL ของ Google Apps Script มาใส่ในเครื่องหมายคำพูดด้านล่าง
+        // ==========================================
+        const GAS_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxVGp0kABni9ZQlKxm3PCunq-JFyHe15dVpvUvVdk23LDPEvbqxzgBPhk7O6HEZqQZH/exec"; 
+        
+        let map;
+        let globalData = { mapData: [], teams: [], statuses: [] };
+        let markerLayers = {}; // เก็บออบเจ็กต์หมุดไว้เพื่ออัปเดตแบบไม่ต้องรีโหลดแผนที่
+        
+        // ชุดสีสำหรับ App สำรวจ (เพิ่มสีได้ตามต้องการ)
+        const appColors = [
+            '#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6'
+        ];
+        const appColorMap = {};
+
+        // ฟังก์ชันกำหนดสีของหมุดตามชื่อ App
+        function getAppColor(appName) {
+            if (!appName) return '#6b7280'; // สีเทาเริ่มต้นถ้าไม่มีชื่อ
+            if (!appColorMap[appName]) {
+                const nextColor = appColors[Object.keys(appColorMap).length % appColors.length];
+                appColorMap[appName] = nextColor;
+            }
+            return appColorMap[appName];
+        }
+
+        // ฟังก์ชันสร้างหน้าตาหมุดแผนที่
+        function createCustomIcon(app, status) {
+            let color = getAppColor(app);
+            let extraClass = '';
+
+            if (status === 'เสร็จงาน') {
+                color = '#9ca3af'; // สีเทา
+            } else if (status === 'เข้างาน') {
+                extraClass = 'blinking-marker';
+            }
+
+            return L.divIcon({
+                className: 'custom-leaflet-icon',
+                html: `<div style="background-color: ${color};" class="marker-pin ${extraClass}"></div>`,
+                iconSize: [30, 42],
+                iconAnchor: [15, 42],
+                popupAnchor: [0, -35]
+            });
+        }
+
+        // เริ่มต้นแผนที่
+        function initMap() {
+            // ตั้งค่าจุดศูนย์กลางแผนที่ที่ประเทศไทย
+            map = L.map('map').setView([13.7563, 100.5018], 6);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+        }
+
+        // ฟังก์ชันวาดหมุดบนแผนที่
+        function renderMarkers() {
+            // ลบหมุดเดิมออกทั้งหมดก่อน (กรณีโหลดใหม่)
+            for (let id in markerLayers) {
+                map.removeLayer(markerLayers[id]);
+            }
+            markerLayers = {};
+
+            const bounds = [];
+
+            globalData.mapData.forEach(point => {
+                // ตรวจสอบพิกัดว่าถูกต้อง
+                const lat = parseFloat(point.lat);
+                const lng = parseFloat(point.lng);
+                
+                if (isNaN(lat) || isNaN(lng)) return;
+
+                const icon = createCustomIcon(point.app, point.status);
+                const marker = L.marker([lat, lng], { icon: icon }).addTo(map);
+
+                // ป้ายชื่อเมื่อเอาเมาส์ชี้
+                marker.bindTooltip(`<b>${point.pea}</b>`, { direction: 'top', offset: [0, -35] });
+
+                // สร้าง HTML สำหรับ Popup
+                const teamOptions = globalData.teams.map(t => `<option value="${t}" ${point.team === t ? 'selected' : ''}>${t}</option>`).join('');
+                const statusOptions = globalData.statuses.map(s => `<option value="${s}" ${point.status === s ? 'selected' : ''}>${s}</option>`).join('');
+
+                const popupHtml = `
+                    <div class="text-sm">
+                        <h3 class="font-bold text-lg text-blue-700 mb-2 border-b pb-1">PEA: ${point.pea}</h3>
+                        <p class="mb-1"><span class="font-semibold text-gray-600">สถานที่:</span> ${point.name || '-'}</p>
+                        <p class="mb-1"><span class="font-semibold text-gray-600">จำนวนเสา:</span> ${point.poles || '-'}</p>
+                        <p class="mb-1"><span class="font-semibold text-gray-600">App สำรวจ:</span> <span class="bg-gray-100 px-1 rounded">${point.app || '-'}</span></p>
+                        <p class="mb-2"><span class="font-semibold text-gray-600">CASE:</span> ${point.caseVal || '-'}</p>
+                        
+                        <div class="mt-3 bg-gray-50 p-2 rounded border">
+                            <label class="block text-xs font-bold text-gray-700 mb-1">ปรับสถานะ</label>
+                            <select id="status-${point.pea}" class="w-full border border-gray-300 rounded p-1 mb-2 bg-white">
+                                <option value="">-- เลือกสถานะ --</option>
+                                ${statusOptions}
+                            </select>
+
+                            <label class="block text-xs font-bold text-gray-700 mb-1">ระบุทีม</label>
+                            <select id="team-${point.pea}" class="w-full border border-gray-300 rounded p-1 mb-3 bg-white">
+                                <option value="">-- เลือกทีม --</option>
+                                ${teamOptions}
+                            </select>
+
+                            <button onclick="saveStatus('${point.pea}')" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-1.5 px-4 rounded shadow transition-colors">
+                                บันทึกข้อมูล
+                            </button>
+                        </div>
+                    </div>
+                `;
+
+                marker.bindPopup(popupHtml);
+                markerLayers[point.pea] = marker;
+                bounds.push([lat, lng]);
+            });
+
+            // ปรับมุมกล้องให้เห็นหมุดทั้งหมด
+            if (bounds.length > 0) {
+                map.fitBounds(bounds, { padding: [50, 50] });
+            }
+        }
+
+        // ฟังก์ชันดึงข้อมูลจาก Google Sheet
+        async function fetchData() {
+            document.getElementById('loading-overlay').style.display = 'flex';
+            document.getElementById('loading-text').innerText = 'กำลังโหลดข้อมูลแผนที่...';
+
+            if (!GAS_WEB_APP_URL) {
+                // โหมดจำลองเมื่อไม่มี API
+                document.getElementById('demo-banner').style.display = 'block';
+                loadMockData();
+                renderMarkers();
+                document.getElementById('loading-overlay').style.display = 'none';
+                return;
+            }
+
+            try {
+                const response = await fetch(GAS_WEB_APP_URL);
+                const data = await response.json();
+                globalData = data;
+                renderMarkers();
+            } catch (error) {
+                console.error("Error fetching data:", error);
+                alert("เกิดข้อผิดพลาดในการโหลดข้อมูล กรุณาตรวจสอบ URL ของ Apps Script");
+            } finally {
+                document.getElementById('loading-overlay').style.display = 'none';
+            }
+        }
+
+        // ฟังก์ชันบันทึกข้อมูล (เรียกจากปุ่มใน Popup)
+        window.saveStatus = async function(peaId) {
+            const statusVal = document.getElementById(`status-${peaId}`).value;
+            const teamVal = document.getElementById(`team-${peaId}`).value;
+
+            if (!statusVal || !teamVal) {
+                alert("กรุณาระบุสถานะและทีมให้ครบถ้วน");
+                return;
+            }
+
+            document.getElementById('loading-overlay').style.display = 'flex';
+            document.getElementById('loading-text').innerText = 'กำลังบันทึกข้อมูล...';
+
+            if (!GAS_WEB_APP_URL) {
+                // จำลองการบันทึกในโหมด Demo
+                setTimeout(() => {
+                    updateLocalData(peaId, statusVal, teamVal);
+                    document.getElementById('loading-overlay').style.display = 'none';
+                    alert(`จำลองการบันทึกสำเร็จ!\nสถานะ: ${statusVal}\nทีม: ${teamVal}`);
+                }, 1000);
+                return;
+            }
+
+            try {
+                const response = await fetch(GAS_WEB_APP_URL, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        peaId: peaId,
+                        status: statusVal,
+                        team: teamVal
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    // อัปเดตข้อมูลในหน้าเว็บโดยไม่ต้องโหลดใหม่
+                    updateLocalData(peaId, statusVal, teamVal);
+                    alert("บันทึกข้อมูลเรียบร้อยแล้ว");
+                } else {
+                    alert("บันทึกข้อมูลล้มเหลว: " + result.error);
+                }
+            } catch (error) {
+                console.error("Error saving data:", error);
+                alert("เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์");
+            } finally {
+                document.getElementById('loading-overlay').style.display = 'none';
+            }
+        }
+
+        // ฟังก์ชันอัปเดตข้อมูลบนแผนที่หลังบันทึกสำเร็จ
+        function updateLocalData(peaId, newStatus, newTeam) {
+            // อัปเดต Data
+            const pointIndex = globalData.mapData.findIndex(p => p.pea === peaId);
+            if (pointIndex > -1) {
+                globalData.mapData[pointIndex].status = newStatus;
+                globalData.mapData[pointIndex].team = newTeam;
+                
+                // อัปเดตไอคอนหมุด
+                const marker = markerLayers[peaId];
+                if (marker) {
+                    const newIcon = createCustomIcon(globalData.mapData[pointIndex].app, newStatus);
+                    marker.setIcon(newIcon);
+                    marker.closePopup();
+                }
+            }
+        }
+
+        // โหลดข้อมูลจำลอง (Demo Mode)
+        function loadMockData() {
+            globalData = {
+                teams: ['ทีม A', 'ทีม B', 'ทีมผู้รับเหมา ก.', 'ทีมสำรวจส่วนกลาง'],
+                statuses: ['รอดำเนินการ', 'เข้างาน', 'เสร็จงาน', 'ติดปัญหา'],
+                mapData: [
+                    { pea: "TR-1001", name: "ซอยสุขุมวิท 10", poles: "5", caseVal: "สายหย่อน", lat: "13.7380", lng: "100.5590", app: "SurveyMaster", status: "รอดำเนินการ", team: "" },
+                    { pea: "TR-1002", name: "หน้าห้างมาบุญครอง", poles: "2", caseVal: "หม้อแปลงชำรุด", lat: "13.7443", lng: "100.5299", app: "PEA-GIS", status: "เข้างาน", team: "ทีม A" },
+                    { pea: "TR-1003", name: "ลาดพร้าว 71", poles: "8", caseVal: "เปลี่ยนเสา", lat: "13.8041", lng: "100.6074", app: "SurveyMaster", status: "เสร็จงาน", team: "ทีม B" },
+                    { pea: "TR-1004", name: "แยกบางนา", poles: "1", caseVal: "ย้ายหม้อแปลง", lat: "13.6675", lng: "100.6026", app: "App-X", status: "ติดปัญหา", team: "ทีมสำรวจส่วนกลาง" }
+                ]
+            };
+        }
+
+        // เริ่มทำงานเมื่อเอกสารโหลดเสร็จ
+        document.addEventListener("DOMContentLoaded", () => {
+            initMap();
+            fetchData();
+        });
+
+    </script>
+</body>
+</html>
